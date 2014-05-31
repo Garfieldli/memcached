@@ -92,7 +92,7 @@ unsigned int slabs_clsid(const size_t size) {
  * Determines the chunk sizes and initializes the slab class descriptors
  * accordingly.
  */
-void slabs_init(const size_t limit, const double factor, const bool prealloc) {
+int slabs_init(const size_t limit, const double factor, const bool prealloc) {
     int i = POWER_SMALLEST - 1;
     unsigned int size = sizeof(item) + settings.chunk_size;
 
@@ -146,6 +146,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     if (prealloc) {
         slabs_preallocate(power_largest);
     }
+
+	return power_largest;
 }
 
 static void slabs_preallocate (const unsigned int maxslabs) {

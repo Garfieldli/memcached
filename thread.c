@@ -72,6 +72,9 @@ static LIBEVENT_DISPATCHER_THREAD dispatcher_thread;
  */
 static LIBEVENT_THREAD *threads;
 
+static LIBEVENT_LOG_THREAD *log_threads;
+
+
 /*
  * Number of worker threads that have finished setting themselves up.
  */
@@ -596,10 +599,12 @@ enum delta_result_type add_delta(conn *c, const char *key,
     return ret;
 }
 
+enum store_item_type old_store_item(item *item, int comm, conn* c);
+
 /*
  * Stores an item in the cache (high level, obeys set/add/replace semantics)
  */
-enum store_item_type store_item(item *item, int comm, conn* c) {
+enum store_item_type old_store_item(item *item, int comm, conn* c) {
     enum store_item_type ret;
     uint32_t hv;
 
@@ -609,6 +614,33 @@ enum store_item_type store_item(item *item, int comm, conn* c) {
     item_unlock(hv);
     return ret;
 }
+
+enum store_item_type store_item(item *vitem, int comm, conn* c) {
+	enum store_item_type ret;
+	
+	int   item_ntotal = ITEM_ntotal(vitem);
+	item *copy_item = NULL;
+	copy_item = calloc(item_ntotal, sizeof(int));
+	memcpy(copy_item, vitem, item_ntotal);
+
+	ret = old_store_item(vitem, comm, c);
+
+	/*
+	 * 放置new_item到线程的消息队列
+	 */
+	unsigned int id = slabs_clsid(item_ntotal);
+	LQ_ITEM *log_item = lqi_new();
+	log_item->item = copy_item;
+	lq_push(log_threads[id].new_log_queue, log_item);
+	char buf[1];
+	buf[0] = '1';
+	if (write(log_threads[id].notify_send_fd, buf, 1) != 1) {
+        perror("Writing to thread notify pipe");
+    }
+
+    return ret;
+}
+
 
 /*
  * Flushes expired items after a flush_all call
@@ -850,5 +882,197 @@ void thread_init(int nthreads, struct event_base *main_base) {
     pthread_mutex_lock(&init_lock);
     wait_for_thread_registration(nthreads);
     pthread_mutex_unlock(&init_lock);
+}
+
+
+// log thread
+
+#define LOG_ITEMS_PER_ALLOC 32
+
+// log thread message Q
+static LQ_ITEM *lqi_freelist;
+static pthread_mutex_t lqi_freelist_lock;
+
+static void lq_init(LQ *lq) {
+    pthread_mutex_init(&lq->lock, NULL);
+    lq->head = NULL;
+    lq->tail = NULL;
+}
+
+static LQ_ITEM *lq_pop(LQ *lq) {
+    LQ_ITEM *item;
+
+    pthread_mutex_lock(&lq->lock);
+    item = lq->head;
+    if (NULL != item) {
+        lq->head = item->next;
+        if (NULL == lq->head)
+            lq->tail = NULL;
+    }
+    pthread_mutex_unlock(&lq->lock);
+
+    return item;
+}
+
+void lq_push(LQ *lq, LQ_ITEM *item) {
+    item->next = NULL;
+
+    pthread_mutex_lock(&lq->lock);
+    if (NULL == lq->tail)
+        lq->head = item;
+    else
+        lq->tail->next = item;
+    lq->tail = item;
+    pthread_mutex_unlock(&lq->lock);
+}
+
+LQ_ITEM *lqi_new(void) {
+    LQ_ITEM *item = NULL;
+    pthread_mutex_lock(&lqi_freelist_lock);
+    if (lqi_freelist) {
+        item = lqi_freelist;
+        lqi_freelist = item->next;
+    }
+    pthread_mutex_unlock(&lqi_freelist_lock);
+
+    if (NULL == item) {
+        int i;
+
+        item = malloc(sizeof(LQ_ITEM) * LOG_ITEMS_PER_ALLOC);
+        if (NULL == item) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return NULL;
+        }
+
+        for (i = 2; i < LOG_ITEMS_PER_ALLOC; i++)
+            item[i - 1].next = &item[i];
+
+        pthread_mutex_lock(&lqi_freelist_lock);
+        item[LOG_ITEMS_PER_ALLOC - 1].next = lqi_freelist;
+        lqi_freelist = &item[1];
+        pthread_mutex_unlock(&lqi_freelist_lock);
+    }
+
+    return item;
+}
+
+static void lqi_free(LQ_ITEM *item) {
+    pthread_mutex_lock(&lqi_freelist_lock);
+	if (item->item != NULL) {
+		free(item);
+	}
+    item->next = lqi_freelist;
+    lqi_freelist = item;
+    pthread_mutex_unlock(&lqi_freelist_lock);
+}
+
+void log_thread_init(int nthreads, struct event_base *main_base) {
+	int back_up_init_count = init_count; //复用原有全局变量
+	int         i;
+	char		path[32];
+	init_count = 0;
+
+    log_threads = calloc(nthreads, sizeof(LIBEVENT_LOG_THREAD));
+    if (! log_threads) {
+        perror("Can't allocate thread descriptors");
+        exit(1);
+    }
+
+    for (i = 0; i < nthreads; i++) {
+        int fds[2];
+        if (pipe(fds)) {
+            perror("Can't create notify pipe");
+            exit(1);
+        }
+
+        log_threads[i].notify_receive_fd = fds[0];
+        log_threads[i].notify_send_fd = fds[1];
+
+		sprintf(path, "%d", i);
+		log_threads[i].log_fd = fopen(path, "ab+");
+
+        setup_log_thread(&log_threads[i]);
+        /* Reserve three fds for the libevent base, and two for the pipe */
+        stats.reserved_fds += 5;
+    }
+
+    /* Create threads after we've done all the libevent setup. */
+    for (i = 0; i < nthreads; i++) {
+        create_worker(worker_libevent, &log_threads[i]);
+    }
+
+    /* Wait for all the threads to set themselves up before returning. */
+    pthread_mutex_lock(&init_lock);
+    wait_for_thread_registration(nthreads);
+    pthread_mutex_unlock(&init_lock);
+	
+	init_count = back_up_init_count;
+}
+
+
+//:~ log thread message Q
+
+void setup_log_thread(LIBEVENT_LOG_THREAD *me) {
+    me->base = event_init();
+    if (! me->base) {
+        fprintf(stderr, "Can't allocate event base\n");
+        exit(1);
+    }
+
+    /* Listen for notifications from other threads */
+    event_set(&me->notify_event, me->notify_receive_fd,
+              EV_READ | EV_PERSIST, log_event_process, me);
+    event_base_set(me->base, &me->notify_event);
+
+    if (event_add(&me->notify_event, 0) == -1) {
+        fprintf(stderr, "Can't monitor libevent notify pipe\n");
+        exit(1);
+    }
+
+    me->new_log_queue = malloc(sizeof(struct log_queue));
+    if (me->new_log_queue == NULL) {
+        perror("Failed to allocate memory for connection queue");
+        exit(EXIT_FAILURE);
+    }
+    lq_init(me->new_log_queue);
+
+    if (pthread_mutex_init(&me->stats.mutex, NULL) != 0) {
+        perror("Failed to initialize mutex");
+        exit(EXIT_FAILURE);
+    }
+
+    me->suffix_cache = cache_create("suffix", SUFFIX_SIZE, sizeof(char*),
+                                    NULL, NULL);
+    if (me->suffix_cache == NULL) {
+        fprintf(stderr, "Failed to create suffix cache\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+
+void log_event_process(int fd, short which, void*arg) {
+	LIBEVENT_LOG_THREAD *me = arg;
+	LQ_ITEM *lq_item;
+	item *item;
+	char buf[1];
+	//unsigned int log_size = 0;
+
+	if (read(fd, buf, 1) != 1) {
+		fprintf(stderr, "Can't read from libevent pipe\n");
+	}
+
+	lq_item = lq_pop(me->new_log_queue);
+
+	if (NULL == lq_item) {
+		return ;
+	}
+
+	item = lq_item->item;
+
+	fwrite(item, ITEM_ntotal(item), 1, me->log_fd);
+	fflush(me->log_fd);
+	lqi_free(lq_item);
 }
 

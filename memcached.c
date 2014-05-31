@@ -239,6 +239,8 @@ static void settings_init(void) {
     settings.shutdown_command = false;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
+
+	settings.persisted_data_path = NULL;
 }
 
 /*
@@ -5111,8 +5113,11 @@ int main (int argc, char **argv) {
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "o:"  /* Extended generic options */
+          "x:" /* persist path */
         ))) {
         switch (c) {
+		case 'x':
+			settings.persisted_data_path = optarg;
         case 'A':
             /* enables "shutdown" command */
             settings.shutdown_command = true;
@@ -5525,7 +5530,7 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init(settings.hashpower_init);
     conn_init();
-    slabs_init(settings.maxbytes, settings.factor, preallocate);
+    int nslabs = slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
@@ -5537,6 +5542,7 @@ int main (int argc, char **argv) {
     }
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
+	log_thread_init(nslabs, main_base);
 
     if (start_assoc_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
