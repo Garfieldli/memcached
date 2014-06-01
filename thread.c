@@ -562,13 +562,41 @@ int item_replace(item *old_it, item *new_it, const uint32_t hv) {
 /*
  * Unlinks an item from the LRU and hashtable.
  */
-void item_unlink(item *item) {
+void old_item_unlink(item *item) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
     item_lock(hv);
     do_item_unlink(item, hv);
     item_unlock(hv);
 }
+
+void item_unlink(item *vitem) {
+	int   item_ntotal = ITEM_ntotal(vitem);
+	item *copy_item = NULL;
+	copy_item = calloc(item_ntotal, sizeof(int));
+	memcpy(copy_item, vitem, item_ntotal);
+
+	old_item_unlink(vitem);
+
+	STATS_LOCK();
+	stats.changes_after_last_snapshot++;
+	STATS_UNLOCK();
+
+	/*
+	 * 放置new_item到线程的消息队列
+	 */
+	unsigned int id = slabs_clsid(item_ntotal);
+	LQ_ITEM *log_item = lqi_new();
+	log_item->item = copy_item;
+	lq_push(log_threads[id].new_log_queue, log_item);
+	char buf[1];
+	buf[0] = 'l';
+	if (write(log_threads[id].notify_send_fd, buf, 1) != 1) {
+        perror("Writing to thread notify pipe");
+    }
+	
+}
+
 
 /*
  * Moves an item to the back of the LRU queue.
@@ -599,8 +627,6 @@ enum delta_result_type add_delta(conn *c, const char *key,
     return ret;
 }
 
-enum store_item_type old_store_item(item *item, int comm, conn* c);
-
 /*
  * Stores an item in the cache (high level, obeys set/add/replace semantics)
  */
@@ -625,6 +651,10 @@ enum store_item_type store_item(item *vitem, int comm, conn* c) {
 
 	ret = old_store_item(vitem, comm, c);
 
+	STATS_LOCK();
+	stats.changes_after_last_snapshot++;
+	STATS_UNLOCK();
+
 	/*
 	 * 放置new_item到线程的消息队列
 	 */
@@ -633,7 +663,7 @@ enum store_item_type store_item(item *vitem, int comm, conn* c) {
 	log_item->item = copy_item;
 	lq_push(log_threads[id].new_log_queue, log_item);
 	char buf[1];
-	buf[0] = '1';
+	buf[0] = 'l';
 	if (write(log_threads[id].notify_send_fd, buf, 1) != 1) {
         perror("Writing to thread notify pipe");
     }
@@ -968,10 +998,11 @@ static void lqi_free(LQ_ITEM *item) {
     pthread_mutex_unlock(&lqi_freelist_lock);
 }
 
-void log_thread_init(int nthreads, struct event_base *main_base) {
-	int back_up_init_count = init_count; //复用原有全局变量
-	int         i;
-	char		path[32];
+void log_thread_init(struct event_base *main_base) {
+	int     i;
+	char	*path;
+	int		back_up_init_count = init_count; //复用原有全局变量
+	int 	nthreads = stats.slabs_num;	
 	init_count = 0;
 
     log_threads = calloc(nthreads, sizeof(LIBEVENT_LOG_THREAD));
@@ -989,9 +1020,12 @@ void log_thread_init(int nthreads, struct event_base *main_base) {
 
         log_threads[i].notify_receive_fd = fds[0];
         log_threads[i].notify_send_fd = fds[1];
-
-		sprintf(path, "%d", i);
+		path = calloc(512, sizeof(char));
+		sprintf(path, "%s/log_%d", settings.persisted_data_path, i);
+		log_threads[i].log_filepath = path;
 		log_threads[i].log_fd = fopen(path, "ab+");
+		log_threads[i].slab_no = i;
+		pthread_mutex_init(&log_threads[i].log_file_lock, NULL);
 
         setup_log_thread(&log_threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
@@ -1055,24 +1089,113 @@ void setup_log_thread(LIBEVENT_LOG_THREAD *me) {
 void log_event_process(int fd, short which, void*arg) {
 	LIBEVENT_LOG_THREAD *me = arg;
 	LQ_ITEM *lq_item;
-	item *item;
+	item *item_p;
 	char buf[1];
+	char snapshot_before_path[512];
 	//unsigned int log_size = 0;
 
 	if (read(fd, buf, 1) != 1) {
 		fprintf(stderr, "Can't read from libevent pipe\n");
 	}
 
-	lq_item = lq_pop(me->new_log_queue);
+	switch(buf[0]) {
+		case 'l': // log
+			lq_item = lq_pop(me->new_log_queue);
 
-	if (NULL == lq_item) {
-		return ;
+			if (NULL == me->log_fd) {
+				fprintf(stderr, "thread log fd is null %d\n", me->slab_no);
+				return ;
+			}
+
+			if (NULL == lq_item) {
+				return ;
+			}
+//			fprintf(stderr, "thread %d\n", me->slab_no);
+
+			item_p = lq_item->item;
+//			pthread_mutex_lock(&me->log_file_lock);
+			fwrite(item_p, ITEM_ntotal(item_p), 1, me->log_fd);
+//			pthread_mutex_unlock(&me->log_file_lock);
+			fflush(me->log_fd);
+			lqi_free(lq_item);
+			break;
+		case 's': //snapshot
+			sprintf(snapshot_before_path, "%s.snapshot_before", me->log_filepath);	
+//			fprintf(stderr, "snapshot thread %d:%s\n", me->slab_no, snapshot_before_path);
+//			pthread_mutex_lock(&me->log_file_lock);
+			fclose(me->log_fd);
+			rename(me->log_filepath, snapshot_before_path);
+			me->log_fd = fopen(me->log_filepath, "ab+");
+//			pthread_mutex_unlock(&me->log_file_lock);
+			break;
+		case 'd': //snapshot done, delete snapshot_before
+//			fprintf(stderr, "delete thread %d\n", me->slab_no);
+			sprintf(snapshot_before_path, "%s.snapshot_before", me->log_filepath);
+//			pthread_mutex_lock(&me->log_file_lock);
+			unlink(snapshot_before_path);
+//			pthread_mutex_unlock(&me->log_file_lock);
+			break;
 	}
-
-	item = lq_item->item;
-
-	fwrite(item, ITEM_ntotal(item), 1, me->log_fd);
-	fflush(me->log_fd);
-	lqi_free(lq_item);
+			
 }
 
+void snapshot_thread_init(void) {
+	pthread_t       thread;
+    pthread_attr_t  attr;
+    int             ret;
+
+    pthread_attr_init(&attr);
+
+    if ((ret = pthread_create(&thread, &attr, snapshot_libevent, NULL)) != 0) {
+        fprintf(stderr, "Can't create snapshot thread: %s\n",
+                strerror(ret));
+        exit(1);
+    }
+}
+
+static struct timeval snapshot_tv; 
+static struct event snapshot_ev_timer;  
+
+void *snapshot_libevent(void *arg) {
+	//	struct event_base *base = event_base_new();
+
+	evutil_timerclear(&snapshot_tv); 
+	snapshot_tv.tv_sec = settings.snapshot_period;  
+
+	evtimer_set(&snapshot_ev_timer, snapshot_process, arg);
+	//evtimer_assign(&snapshot_ev_timer, base, shnapshot_process, &nslabs);
+
+	event_add(&snapshot_ev_timer, &snapshot_tv);
+	event_dispatch();
+	return NULL;
+}
+
+void snapshot_process(int fd, short n, void *arg) {
+	char buf[1];
+	int i = 0;
+
+	if (stats.changes_after_last_snapshot >= settings.change_num_need_snapshop) {
+		STATS_LOCK();
+		stats.changes_after_last_snapshot = 0;
+		STATS_UNLOCK();
+		
+		// 开始snapshot，告诉所有log进程，备份原有log
+		// 并将新的log进入新的文件中
+		buf[0] = 's';
+		
+		for (i=0; i<stats.slabs_num; i++) {
+			write(log_threads[i].notify_send_fd, buf, 1);
+		}
+
+		snapshot_all_slab();
+
+		buf[0] = 'd';
+		for (i=0; i<stats.slabs_num; i++) {
+			write(log_threads[i].notify_send_fd, buf, 1);
+		}
+
+		
+	}
+
+	event_add(&snapshot_ev_timer, &snapshot_tv);
+}

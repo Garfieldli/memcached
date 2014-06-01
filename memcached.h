@@ -282,6 +282,8 @@ struct stats {
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
     bool          lru_crawler_running; /* crawl in progress */
+	uint64_t	  changes_after_last_snapshot;
+	uint64_t	  slabs_num;
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -327,6 +329,8 @@ struct settings {
     uint32_t lru_crawler_tocrawl; /* Number of items to crawl per run */
 
 	char *persisted_data_path; /* 持久化数据目录 */
+	int change_num_need_snapshop; /* 发生的快照最小变更数 */
+	int snapshot_period;       /* 快照时间间隔 */
 };
 
 extern struct stats stats;
@@ -638,13 +642,24 @@ typedef struct {
     cache_t *suffix_cache;      /* suffix cache */
     uint8_t item_lock_type;     /* use fine-grained or global item lock */
 	FILE		*log_fd;
+	char		*log_filepath;
+	pthread_mutex_t log_file_lock;
+	int			slab_no;
 } LIBEVENT_LOG_THREAD;
 
 
 LQ_ITEM *lqi_new(void);
 void lq_push(LQ *lq, LQ_ITEM *item);
-void log_thread_init(int nthreads, struct event_base *main_base);
-
+void log_thread_init(struct event_base *main_base);
 void setup_log_thread(LIBEVENT_LOG_THREAD *me);
 void log_event_process(int fd, short which, void*arg);
+
+void snapshot_thread_init(void);
+void *snapshot_libevent(void *arg);
+void snapshot_all_slab(void);
+void snapshot_process(int fd, short n, void *arg);
+
+enum store_item_type old_store_item(item *item, int comm, conn* c);
+void old_item_unlink(item *item);
+
 

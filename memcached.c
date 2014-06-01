@@ -172,7 +172,7 @@ static rel_time_t realtime(const time_t exptime) {
 }
 
 static void stats_init(void) {
-    stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
+    stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = stats.changes_after_last_snapshot = stats.slabs_num = 0;
     stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = stats.reclaimed = 0;
     stats.touch_cmds = stats.touch_misses = stats.touch_hits = stats.rejected_conns = 0;
     stats.malloc_fails = 0;
@@ -241,6 +241,8 @@ static void settings_init(void) {
     settings.flush_enabled = true;
 
 	settings.persisted_data_path = NULL;
+	settings.change_num_need_snapshop = 1000;
+	settings.snapshot_period = 60;
 }
 
 /*
@@ -5113,11 +5115,21 @@ int main (int argc, char **argv) {
           "S"   /* Sasl ON */
           "F"   /* Disable flush_all */
           "o:"  /* Extended generic options */
-          "x:" /* persist path */
+          "x:"  /* persist path */
+          "y:"  /* >y 次操作才进行snapshot */
+          "z:"  /* 每z秒唤醒一次snapshot */
         ))) {
         switch (c) {
 		case 'x':
 			settings.persisted_data_path = optarg;
+			break;
+		case 'y':
+			settings.change_num_need_snapshop = atoi(optarg);
+			break;
+		case 'z':
+			settings.snapshot_period = atoi(optarg);
+			break;
+			
         case 'A':
             /* enables "shutdown" command */
             settings.shutdown_command = true;
@@ -5530,7 +5542,7 @@ int main (int argc, char **argv) {
     stats_init();
     assoc_init(settings.hashpower_init);
     conn_init();
-    int nslabs = slabs_init(settings.maxbytes, settings.factor, preallocate);
+    slabs_init(settings.maxbytes, settings.factor, preallocate);
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
@@ -5542,7 +5554,8 @@ int main (int argc, char **argv) {
     }
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
-	log_thread_init(nslabs, main_base);
+	log_thread_init(main_base);
+	snapshot_thread_init();
 
     if (start_assoc_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);

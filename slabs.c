@@ -92,7 +92,7 @@ unsigned int slabs_clsid(const size_t size) {
  * Determines the chunk sizes and initializes the slab class descriptors
  * accordingly.
  */
-int slabs_init(const size_t limit, const double factor, const bool prealloc) {
+void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     int i = POWER_SMALLEST - 1;
     unsigned int size = sizeof(item) + settings.chunk_size;
 
@@ -146,8 +146,7 @@ int slabs_init(const size_t limit, const double factor, const bool prealloc) {
     if (prealloc) {
         slabs_preallocate(power_largest);
     }
-
-	return power_largest;
+	stats.slabs_num = power_largest+1;
 }
 
 static void slabs_preallocate (const unsigned int maxslabs) {
@@ -881,4 +880,44 @@ void stop_slab_maintenance_thread(void) {
     /* Wait for the maintenance thread to stop */
     pthread_join(maintenance_tid, NULL);
     pthread_join(rebalance_tid, NULL);
+}
+
+void snapshot_slab(int id, FILE *fp);
+
+void snapshot_all_slab(void) {
+	int current_slab = 0;
+	char snapshot_path[128];
+	FILE *fp;
+	sprintf(snapshot_path, "%s/snapshot_%d", settings.persisted_data_path, (int)time(NULL));
+	fp = fopen(snapshot_path, "ab+");
+	
+	for(;current_slab < power_largest; current_slab++) {
+		snapshot_slab(current_slab, fp);
+	}
+
+	fclose(fp);
+}
+
+void snapshot_slab(int id, FILE *fp) {
+	char *ptr;
+	slabclass_t *slabclass_p;
+	item *it;
+	int x;
+	
+
+	if (slabclass[id].list_size == 0) {
+		return;
+	}
+	
+	for (int current_list = 0; current_list < slabclass[id].slabs; current_list++) {
+		ptr = (char *)slabclass[id].slab_list[current_list];
+		slabclass_p = &slabclass[id];
+	    for (x = 0; x < slabclass_p->perslab; x++) {
+			it = (item *)ptr;
+			if ((it->it_flags & ITEM_LINKED) != 0) {
+				fwrite(it, ITEM_ntotal(it), 1, fp);
+			}
+	        ptr += slabclass_p->size;
+	    }
+	}
 }
