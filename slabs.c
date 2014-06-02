@@ -886,9 +886,16 @@ void snapshot_slab(int id, FILE *fp);
 
 void snapshot_all_slab(void) {
 	int current_slab = 0;
-	char snapshot_path[128];
+	char snapshot_path[512];
+	char snapshot_path_backup[512];
 	FILE *fp;
-	sprintf(snapshot_path, "%s/snapshot_%d", settings.persisted_data_path, (int)time(NULL));
+	sprintf(snapshot_path, "%s/snapshot", settings.persisted_data_path);
+	sprintf(snapshot_path_backup, "%s/snapshot_%d", settings.persisted_data_path, (int)time(NULL));
+
+	if (access(snapshot_path, W_OK)) {
+		rename(snapshot_path, snapshot_path_backup);
+	}
+	
 	fp = fopen(snapshot_path, "ab+");
 	
 	for(;current_slab < power_largest; current_slab++) {

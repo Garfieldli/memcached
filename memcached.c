@@ -5555,6 +5555,7 @@ int main (int argc, char **argv) {
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
 	log_thread_init(main_base);
+	recover_thread_init();	
 	snapshot_thread_init();
 
     if (start_assoc_maintenance_thread() == -1) {

@@ -314,6 +314,7 @@ int do_item_link(item *it, const uint32_t hv) {
     assoc_insert(it, hv);
     item_link_q(it);
     refcount_incr(&it->refcount);
+	notify_log(it);
     mutex_unlock(&cache_lock);
 
     return 1;
@@ -331,6 +332,7 @@ void do_item_unlink(item *it, const uint32_t hv) {
         assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
         do_item_remove(it);
+		notify_log(it);
     }
     mutex_unlock(&cache_lock);
 }

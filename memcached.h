@@ -659,7 +659,9 @@ void *snapshot_libevent(void *arg);
 void snapshot_all_slab(void);
 void snapshot_process(int fd, short n, void *arg);
 
-enum store_item_type old_store_item(item *item, int comm, conn* c);
-void old_item_unlink(item *item);
+void notify_log(item *vitem);
 
+void recover_thread_init(void);
+void *recover(void *arg);
+int redo_file(char *fpath);
 

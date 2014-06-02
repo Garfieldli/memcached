@@ -562,39 +562,12 @@ int item_replace(item *old_it, item *new_it, const uint32_t hv) {
 /*
  * Unlinks an item from the LRU and hashtable.
  */
-void old_item_unlink(item *item) {
+void item_unlink(item *item) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
     item_lock(hv);
     do_item_unlink(item, hv);
     item_unlock(hv);
-}
-
-void item_unlink(item *vitem) {
-	int   item_ntotal = ITEM_ntotal(vitem);
-	item *copy_item = NULL;
-	copy_item = calloc(item_ntotal, sizeof(int));
-	memcpy(copy_item, vitem, item_ntotal);
-
-	old_item_unlink(vitem);
-
-	STATS_LOCK();
-	stats.changes_after_last_snapshot++;
-	STATS_UNLOCK();
-
-	/*
-	 * 放置new_item到线程的消息队列
-	 */
-	unsigned int id = slabs_clsid(item_ntotal);
-	LQ_ITEM *log_item = lqi_new();
-	log_item->item = copy_item;
-	lq_push(log_threads[id].new_log_queue, log_item);
-	char buf[1];
-	buf[0] = 'l';
-	if (write(log_threads[id].notify_send_fd, buf, 1) != 1) {
-        perror("Writing to thread notify pipe");
-    }
-	
 }
 
 
@@ -630,7 +603,7 @@ enum delta_result_type add_delta(conn *c, const char *key,
 /*
  * Stores an item in the cache (high level, obeys set/add/replace semantics)
  */
-enum store_item_type old_store_item(item *item, int comm, conn* c) {
+enum store_item_type store_item(item *item, int comm, conn* c) {
     enum store_item_type ret;
     uint32_t hv;
 
@@ -640,37 +613,6 @@ enum store_item_type old_store_item(item *item, int comm, conn* c) {
     item_unlock(hv);
     return ret;
 }
-
-enum store_item_type store_item(item *vitem, int comm, conn* c) {
-	enum store_item_type ret;
-	
-	int   item_ntotal = ITEM_ntotal(vitem);
-	item *copy_item = NULL;
-	copy_item = calloc(item_ntotal, sizeof(int));
-	memcpy(copy_item, vitem, item_ntotal);
-
-	ret = old_store_item(vitem, comm, c);
-
-	STATS_LOCK();
-	stats.changes_after_last_snapshot++;
-	STATS_UNLOCK();
-
-	/*
-	 * 放置new_item到线程的消息队列
-	 */
-	unsigned int id = slabs_clsid(item_ntotal);
-	LQ_ITEM *log_item = lqi_new();
-	log_item->item = copy_item;
-	lq_push(log_threads[id].new_log_queue, log_item);
-	char buf[1];
-	buf[0] = 'l';
-	if (write(log_threads[id].notify_send_fd, buf, 1) != 1) {
-        perror("Writing to thread notify pipe");
-    }
-
-    return ret;
-}
-
 
 /*
  * Flushes expired items after a flush_all call
@@ -1085,7 +1027,7 @@ void setup_log_thread(LIBEVENT_LOG_THREAD *me) {
     }
 }
 
-
+static int begin_recover = 0;
 void log_event_process(int fd, short which, void*arg) {
 	LIBEVENT_LOG_THREAD *me = arg;
 	LQ_ITEM *lq_item;
@@ -1174,7 +1116,8 @@ void snapshot_process(int fd, short n, void *arg) {
 	char buf[1];
 	int i = 0;
 
-	if (stats.changes_after_last_snapshot >= settings.change_num_need_snapshop) {
+
+	if (begin_recover == 0 && stats.changes_after_last_snapshot >= settings.change_num_need_snapshop) {
 		STATS_LOCK();
 		stats.changes_after_last_snapshot = 0;
 		STATS_UNLOCK();
@@ -1199,3 +1142,148 @@ void snapshot_process(int fd, short n, void *arg) {
 
 	event_add(&snapshot_ev_timer, &snapshot_tv);
 }
+
+
+void notify_log(item *vitem) {
+	int   item_ntotal = ITEM_ntotal(vitem);
+	item *copy_item = NULL;
+
+	if (begin_recover) {
+		return;
+	}
+	copy_item = calloc(item_ntotal, sizeof(int));
+	memcpy(copy_item, vitem, item_ntotal);
+
+	/*
+	 * 放置new_item到线程的消息队列
+	 */
+	unsigned int id = slabs_clsid(item_ntotal);
+	LQ_ITEM *log_item = lqi_new();
+	log_item->item = copy_item;
+	lq_push(log_threads[id].new_log_queue, log_item);
+	char buf[1];
+	buf[0] = 'l';
+	if (write(log_threads[id].notify_send_fd, buf, 1) != 1) {
+        perror("Writing to thread notify pipe");
+    }
+	stats.changes_after_last_snapshot++;
+}
+
+
+static int recover_finished = 0;
+void recover_thread_init(void) {
+	pthread_t       thread;
+    pthread_attr_t  attr;
+    int             ret;
+
+    pthread_attr_init(&attr);
+
+    if ((ret = pthread_create(&thread, &attr, recover, NULL)) != 0) {
+        fprintf(stderr, "Can't create snapshot thread: %s\n",
+                strerror(ret));
+        exit(1);
+    }
+
+	pthread_mutex_lock(&init_lock);
+	while (recover_finished == 0) {
+		pthread_cond_wait(&init_cond, &init_lock);
+	}
+	pthread_mutex_unlock(&init_lock);
+}
+
+int static recover_lock_type = ITEM_LOCK_GLOBAL;
+void *recover(void *arg) {
+	char path_buffer[512];
+	char path_buffer2[512];
+	char *snapshot_path = path_buffer;
+
+	int slab_num = 0;
+	char *log_path = path_buffer;
+	char *log_before_snapshot_path = path_buffer2;
+	
+	pthread_setspecific(item_lock_type_key, &recover_lock_type);
+
+	begin_recover = 1;
+	sprintf(snapshot_path, "%s/snapshot", settings.persisted_data_path);
+	redo_file(snapshot_path);
+
+	// 恢复bin log
+	sprintf(log_path, "%s/log_%d", settings.persisted_data_path, slab_num);
+	while (access(log_path, R_OK) == 0) {
+		sprintf(log_before_snapshot_path, "%s/log_%d.snapshot_before", settings.persisted_data_path, slab_num);
+		redo_file(log_before_snapshot_path);
+		redo_file(log_path);
+		slab_num++;
+		sprintf(log_path, "%s/log_%d", settings.persisted_data_path, slab_num);
+	}
+	begin_recover = 0;
+
+	pthread_mutex_lock(&init_lock);
+    recover_finished = 1;
+    pthread_cond_signal(&init_cond);
+    pthread_mutex_unlock(&init_lock);
+	return NULL;
+}
+
+int redo_file(char *fpath) {
+	FILE *fp = NULL;
+	char read_buffer[1024*1024*8]; // 8M
+	int buffer_size = 1024*1024*8;
+	int file_readed_length = 0;
+	char *current_ptr = NULL;
+	item *cr_item = NULL;
+	item *cw_item = NULL;
+	uint32_t hv = 0;
+	int processed_size = 0;
+	int need_to_read_size = buffer_size;
+	char *read_begin_ptr = read_buffer;
+
+	if (access(fpath, R_OK)!=0) {
+		return 1;
+	}
+
+	fp = fopen(fpath, "r");
+	if (fp == NULL) {
+		return -1;
+	}
+
+	while(!feof(fp)) {
+		file_readed_length = fread(read_begin_ptr, sizeof(char), need_to_read_size, fp);
+		current_ptr = read_buffer;
+		cr_item = (item *)current_ptr;
+		processed_size = 0;
+
+		while (processed_size + ITEM_ntotal(cr_item) <= buffer_size - need_to_read_size + file_readed_length) {
+			if ((cr_item->it_flags & ITEM_LINKED) != 0) {
+				// add
+				cw_item = item_alloc(ITEM_key(cr_item), cr_item->nkey, 0, 0, cr_item->nbytes);
+				memcpy(cw_item,  cr_item, ITEM_ntotal(cr_item));
+				hv = hash(ITEM_key(cw_item), cw_item->nkey);
+				item_lock(hv);
+				do_item_link(cw_item, hv);
+				item_unlock(hv);
+			} else {
+				// delete
+				cw_item = item_get(ITEM_key(cr_item), cr_item->nkey);
+				if (ITEM_ntotal(cw_item) == ITEM_ntotal(cr_item) && cw_item->nbytes == cr_item->nbytes) {
+					if (memcmp(ITEM_data(cw_item), ITEM_data(cr_item), cr_item->nbytes)) {
+						hv = hash(ITEM_key(cw_item), cw_item->nkey);
+						item_lock(hv);
+						do_item_unlink(cw_item, hv);
+						item_unlock(hv);
+					}
+				}
+			}
+			
+			current_ptr += ITEM_ntotal(cr_item);
+			processed_size += ITEM_ntotal(cr_item);
+		}
+
+		// 读取更多文件
+		need_to_read_size = processed_size;
+		read_begin_ptr = read_buffer + (buffer_size - processed_size);
+		memcpy(read_buffer, current_ptr, buffer_size - processed_size);
+	}
+	return 0;
+}
+
